@@ -36,6 +36,8 @@ The tutorial uses the `airway` dataset from Bioconductor, which includes RNA-seq
 git clone https://github.com/caparada/RNAseq_airway_tutorial.git
 cd RNAseq_airway_tutorial
 ```
+📘 **Or skip to the interactive HTML tutorial here**:  
+➡️ [RNA-seq Pipeline – GitHub Pages](https://caparada.github.io/RNAseq/)
 
 ### 2. Open and Run the Tutorial
 
