@@ -30,22 +30,20 @@ The tutorial uses the `airway` dataset from Bioconductor, which includes RNA-seq
 
 ## How to Use
 
+📘 **Or skip to the interactive HTML tutorial here**:  
+➡️ [RNA-seq Pipeline – GitHub Pages](https://caparada.github.io/RNAseq/
+
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/caparada/RNAseq_airway_tutorial.git
-cd RNAseq_airway_tutorial
+git clone https://github.com/caparada/RNAseq.git
+cd RNAseq
 ```
-📘 **Or skip to the interactive HTML tutorial here**:  
-➡️ [RNA-seq Pipeline – GitHub Pages](https://caparada.github.io/RNAseq/)
+)
 
 ### 2. Open and Run the Tutorial
 
-Open `RNAseq_Pipeline_airway.Rmd` in RStudio, then click **Knit** to generate the HTML output. Alternatively, run:
-
-```r
-rmarkdown::render("RNAseq_Pipeline_airway.Rmd")
-```
+Open `RNAseq_Pipeline_airway.Rmd` in RStudio
 
 ### 3. Output Directory
 
