@@ -1,0 +1,1076 @@
+---
+title: "RNAseq Analysis Pipeline"
+author: "Carolina"
+date: "r Sys.Date()"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = T, warning = F, message = F)
+
+```
+
+# RNA-seq Differential Expression and Enrichment Analysis in R
+
+# Introduction
+
+This tutorial demonstrates a full RNA-seq differential gene expression (DGE) 
+analysis using the **airway** dataset. The dataset comes from a study on the 
+effect of dexamethasone (a glucocorticoid) on human airway smooth muscle cells. 
+It is commonly used as a teaching resource for RNA-seq workflows.
+
+Raw count preprocessing
+
+Gene filtering with edgeR
+
+Differential expression analysis with DESeq2
+
+Exploratory Data Analysis (PCA, heatmaps, volcano plots)
+
+Over-representation analysis (ORA) (GO, KEGG, DO)
+
+Gene set enrichment analysis (GSEA)
+
+Plotting and exporting results
+
+The pipeline is modular, well-commented, and reproducible for similar RNA-seq experiments.
+
+# The input data 
+The RNA-Seq data from the airway package is a widely used public dataset for demonstrating RNA sequencing analysis workflows, particularly differential gene expression analysis between treated and untreated cell lines. 
+
+Experiment Description:
+
+Cell lines: Primary human airway smooth muscle cells.
+
+Treatment: Dexamethasone, a synthetic glucocorticoid steroid used for its anti-inflammatory properties, particularly relevant for asthma.
+
+Conditions: The experiment includes both treated and untreated samples.
+
+Number of cell lines: 4
+
+Samples per cell line: For each of the 4 cell lines, there is a treated and an untreated sample, resulting in 8 samples in total.
+
+Treatment details: 1 micromolar dexamethasone for 18 hours. 
+
+We follow a best-practice analysis pipeline using **DESeq2**, **edgeR**, **clusterProfiler**, and **DOSE**, with advanced filtering, annotation, and 
+enrichment.
+
+# 1. Load packages
+```{r libraries}
+
+library(airway)
+library(DESeq2)
+library(edgeR)
+library(tidyverse)
+library(pheatmap)
+library(vsn)
+library(clusterProfiler)
+library(DOSE)
+library(org.Hs.eg.db)
+library(GOSemSim)
+library(EnhancedVolcano)
+library(AnnotationDbi)
+library(ggrepel)
+library(scales)
+library(viridis)
+library(SummarizedExperiment)
+library(stats)
+library(ggrepel)
+library(plotly)
+
+# set up a working directory path
+setwd("C:\\Users\\caspb\\OneDrive\\Git\\")
+
+# Define your output directory path
+outdir <- "RNAseq_results"
+
+# Create the directory if it doesn't exist
+if (!dir.exists(outdir)) {
+  dir.create(outdir, recursive = T)
+}
+
+```
+
+
+# 2. Load the airway dataset and prepare input
+```{r load-data}
+
+# Extract raw counts
+data('airway')
+rawCounts <- assay(airway)
+
+# Prepare sample metadata
+colData <- data.frame(condition = airway$dex, 
+                      row.names = colnames(airway))
+
+# Check levels
+print(levels(airway$dex))
+
+# Relevel. Untreated samples will be used as reference
+colData$condition <- relevel(factor(colData$condition), ref = 'untrt')
+
+# Ensure rawCounts and colData aligment
+# Check alignment
+stopifnot(all(colnames(rawCounts) == rownames(colData)))
+
+```
+
+# 3. Filter low-expression genes using edgeR
+```{r filter-genes}
+
+# Filtering low-expression genes using edgeR
+cat("Applying edgeR::filterByExpr filtering...\n")
+
+# Create group factor from sample info
+group <- colData$condition
+
+# Create a DGEList object with raw counts and group info
+y <- DGEList(counts = rawCounts, group = group)
+
+# Apply filterByExpr to find genes with sufficient counts
+keep_genes_edgeR <- filterByExpr(y, group = group)
+
+# Subset DGEList to keep only expressed genes
+y_filtered <- y[keep_genes_edgeR, , keep.lib.sizes = F]
+
+# Extract filtered counts matrix for downstream use
+filtered_counts <- y_filtered$counts
+
+# Report filtering results
+cat("Genes before edgeR::filterByExpr:", nrow(rawCounts), "\n")
+cat("Genes remaining after edgeR::filterByExpr:", nrow(filtered_counts), "\n")
+
+if (nrow(filtered_counts) == 0) {
+  stop("No genes passed the edgeR::filterByExpr criteria. Check input data.")
+}
+
+```
+
+# 4. Annotate filtered data with Gene Symbols
+```{r annotate-genes}
+
+# Clean Ensembl IDs (remove version suffix)
+ensembl_ids_raw <- rownames(filtered_counts)
+ensembl_ids_clean <- gsub("\\..*", "", ensembl_ids_raw) 
+
+# Map Ensembl to Gene Symbols
+id_map <- bitr(ensembl_ids_clean,
+               fromType = "ENSEMBL",
+               toType = "SYMBOL",
+               OrgDb = org.Hs.eg.db)
+
+# Prepare counts as data frame and merge
+filtered_df <- as.data.frame(filtered_counts)
+filtered_df$ENSEMBL <- ensembl_ids_clean
+
+# Merge to get SYMBOL and ENSEMBL in final matrix
+filtered_annotated <- merge(id_map, filtered_df, by = "ENSEMBL")
+
+# Remove duplicate genes keeping the one w/highest expression version
+# Calculate row sums (total expression across all samples)
+expr_cols <- setdiff(colnames(filtered_annotated), c("ENSEMBL", "SYMBOL"))
+filtered_annotated$sumExpr <- rowSums(filtered_annotated[, expr_cols])
+
+# Order by SYMBOL and descending expression
+filtered_annotated_sorted <- filtered_annotated[order(filtered_annotated$SYMBOL, -filtered_annotated$sumExpr), ]
+
+# Remove duplicates, keeping the one with highest expression
+filtered_annotated_unique <- filtered_annotated_sorted[!duplicated(filtered_annotated_sorted$SYMBOL), ]
+
+# Drop the helper column
+filtered_annotated_unique$sumExpr <- NULL
+
+# Save output files
+write.csv(filtered_annotated_unique, 
+          file = 'RNAseq_results\\filtered_counts_matrix_annotated_unique.csv',
+          row.names = F)
+write.csv(colData, 
+          file = 'RNAseq_results\\sample_metadata.csv', 
+          row.names = T)
+
+```
+
+
+# 5. Run DESeq2 on Filtered Data
+```{r run-deseq2}
+
+# Convert filtered data into a matrix with rownames as gene SYMBOLs
+counts_matrix <- as.matrix(filtered_annotated_unique[, expr_cols])
+rownames(counts_matrix) <- filtered_annotated_unique$SYMBOL
+
+#  Create DESeq2 dataset
+dds <- DESeqDataSetFromMatrix(countData = counts_matrix,
+                              colData = colData,
+                              design = ~ condition)
+# This sets up your model to compare conditions (Mt vs Wt)
+
+# Confirm the levels:
+levels(dds$condition)
+
+# Run DESeq2
+dds <- DESeq(dds)
+
+# Summarize DESeqDataSet object
+summary(dds) 
+
+# Extract results
+# The resulst() function also automatically adjust p-values for False Discovery 
+# Rate (FDR)
+res <- results(dds,
+               pAdjustMethod = 'BH',
+               lfcThreshold = 0.585)
+
+# Summarize results
+summary(res)
+
+```
+
+# 6.Conduct Quality Control (QC) and Exploratory Data Analysis (EDA)
+
+# 6.1 Dispersion estimation
+This plot shows:
+(a) black per-gene dispersion estimates, 
+(b) a red trend line representing the global relationship between dispersion
+and normalized count,
+(c) blue 'shrunken' values moderating individual dispersion estimates by the 
+global relationship, and 
+(d) blue-circled dispersion outliers with high gene-wise dispersion that were 
+not adjusted.
+```{r dispersion-estimates}
+
+# Check dispersion estimates
+plotDispEsts(dds)
+
+```
+
+
+# 6.2 Histogram of total counts/gene
+```{r histogram-total-counts}
+
+# Histogram of total counts per gene
+hist(rowSums(log10(counts(dds, normalized = F)+1)),
+     breaks = 100,
+     main = "Histogram of Total Gene Counts",
+     xlab = "Total Counts per Gene (log10)")
+abline(v = 10, col = "red", lty = 2)
+
+```
+
+
+# 6.3 Histogram of pvalues
+It should be uniform under the null hypothesis; skew to the right may indicate 
+batch or other effects 
+```{r histogram-pvalues}
+
+hist(res$pvalue, breaks=40, col="grey")
+
+```
+
+
+# 6.4 Boxplot of counts per sample
+To visualize the distribution of counts within each sample
+```{r boxplot-counts-per-sample}
+
+# Boxplot of raw or normalized counts/sample
+boxplot(log10(counts(dds, normalized=F) + 1),
+        main="Boxplot of Log10 Normalized Counts",
+        las=2, cex.axis=0.8)
+
+```
+
+
+# 6.5. Compute sample-to-sample Euclidean distance
+Computing sample-to-sample Euclidean distances in RNA-seq analysis is a useful exploratory step.
+- Ouliers detection: identifies samples that behave differently from the rest 
+due to poor quality RNA, mislabeling, contamination.
+- Asses replicate consistency where biological or technical replicates should 
+cluster closely.Large distances between replicates could indicate batch effects 
+or biological variability.
+- Visualize global expression patterns: used in heatmaps or dendrograms to show overall similarity between samples based on their expression profiles.
+- EValuate batch effects: If samples cluster by batch rather than by biological condition, it signals technical bias you may need to correct for (e.g., with limma::removeBatchEffect() or ComBat())
+```{r sample-to-sample-distance}
+
+# Apply Variance Stabilizing TRansformation (VST) to the DESeqDataSet object
+vsd <- vst(dds)
+
+# Compute Euclidean distances between all samples 
+# Transpose it with as 'dist()' computes distances between rows. 
+sampleDists <- dist(t(assay(vsd)))
+
+# Convert the 'dist' object to a matrix, which is easier to visualize and pass 
+# to plotting functions
+sampleDistMatrix <- as.matrix(sampleDists)
+rownames(sampleDistMatrix) <- colnames(vsd)
+colnames(sampleDistMatrix) <- colnames(vsd)
+
+annotation_df <- as.data.frame(colData(vsd)[, "condition", drop = F])
+
+# Plot the sample-to-sample distance matrix as a heatmap using the 'pheatmap' package
+pheatmap(sampleDistMatrix,
+         annotation_col = annotation_df,
+         clustering_distance_rows = sampleDists,
+         clustering_distance_cols = sampleDists,
+         main = "Sample-to-Sample Distance Heatmap")
+
+```
+
+
+# 6.6 PCA
+PCA is also a QC and EDA step in RNA-seq workflows. It is performed to visually 
+assess global patterns in the data.
+Helpful to see if samples are clustering by condition or treatment, identify
+samples that do not cluster with their group and may be outliers, see if samples
+group by technical variables and spot batch effects, and understand variance
+(Ddtermine what factors explain the most variation).
+```{r pca-plot}
+
+# vsd <- vst(dds, blind = FALSE)
+
+pcaData <- plotPCA(vsd, intgroup = "condition", returnData = T)
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+
+# Add sample names from rownames
+pcaData$Sample <- rownames(pcaData)
+
+ggplot(pcaData, aes(PC1, PC2, color = condition)) +
+  geom_point(size = 4) +
+  xlab(paste0("PC1: ", percentVar[1], "%")) +
+  ylab(paste0("PC2: ", percentVar[2], "%")) +
+  theme_minimal() + ggtitle("PCA Plot")
+
+```
+
+
+# 7.Differential Gene Expression (DGE) Analysis
+
+# 7.1 Plot counts
+Useful to examine counts of reads for a single gene across the groups. The 
+plotCounts() function normalizes counts by the estimated size factors (or normalization factors if these were used) and adds a pseudocount of 1/2 to allow
+for log scale plotting. 
+
+The counts are grouped by the variables in intgroup, where more than one 
+variable can be specified. Here we specify the gene which had the smallest 
+pvalue from the results table. 
+
+One can select the gene to plot by rowname or by numeric index.
+
+```{r plotcounts_significant}
+
+# Plotting the most significant gene (lowest padj value) per condition
+plotCounts(dds, 
+           gene=which.min(res$padj),
+           intgroup="condition")
+
+```
+
+```{r plotcounts_up}
+
+# Plotting the most upregulated gene (highest fold change) per condition
+plotCounts(dds,
+           gene=which.max(res$log2FoldChange),
+           intgroup="condition")
+```
+
+You can also loop over genes of interest (e.g: disease drivers) and plot counts
+for each gene stratified by condition
+
+```{r loop-genes}
+
+# Loop over genes_of_interest
+# Plot and save count plots
+genes_of_interest <- c("CTSC", "SLCO5A1", "UNC5C", "PXDN", "NOTCH3", "GRIP2",
+                          "FAT3","PKP1", "TOX3", "VCAN", "VNN1", "CA2", "ELF3",
+                          "WT1", "SALL3", "INSM1", "PIWIL1")
+
+# Get normalized counts
+norm_counts <- counts(dds, 
+                      normalized = T)
+
+# Get metadata
+sample_info <- as.data.frame(colData(dds))
+
+# Create output folder
+outdir <- "RNAseq_results/CountPlot_Drivers/"
+dir.create(outdir, showWarnings = F)
+
+# Loop over genes
+for (gene in genes_of_interest) {
+  if (!(gene %in% rownames(norm_counts))) {
+    warning(paste("Gene not found in normalized count matrix:", gene))
+    next
+  }
+  
+  # Extract expression for current gene
+  gene_data <- data.frame(
+    normalized_count = norm_counts[gene, ],
+    sample = colnames(norm_counts),
+    condition = sample_info$condition
+  )
+  
+  # Generate count plot
+  p <- ggplot(gene_data,
+              aes(x = condition, y = normalized_count, fill = condition)) + 
+    geom_boxplot(alpha = 0.3, outlier.shape = NA, color = "black") +
+    geom_jitter(width = 0.15, size = 3, aes(color = condition)) +
+    theme_minimal(base_size = 14) +
+    labs(title = paste("Expression of", gene),
+         y = "Normalized Count",
+         x = "Condition") +
+    theme(legend.position = "none") +
+    scale_fill_brewer(palette = "Set1") +
+    scale_color_brewer(palette = "Set1")
+  
+  # Save plot
+  ggsave(filename = paste0(outdir, paste0(gene, "_count_plot.png")),
+         plot = p,
+         width = 5,
+         height = 4, 
+         dpi = 300)
+  
+}
+
+cat("Outputs saved in", outdir)
+
+# Display plot
+print(p)
+
+```
+
+
+# 7.2 Volcano Plot
+DGE analysis between Dexamethasone treated vs untreated samples visualized by a
+volcano plot. 
+
+X-axis:
+- Genes far to the right are upregulated (higher expression in treated samples).
+- Genes far to the left are downregulated (lower expression in treated samples).
+
+Y-axis:
+- The adjusted p-value (FDR) significance is shown on a negative log scale:
+- Genes plotted higher are more statistically significant (smaller padj)
+- Genes near the bottom are not statistically significant (higher padj)
+```{r volcano-plot}
+
+# Convert DESeq2 results object to a standard df for easier manipulation
+res_df <- as.data.frame(res)
+
+# Add a SYMBOL column (currently using rownames as gene identifiers.
+# It can be Ensembl IDs or symbols
+res_df$SYMBOL <- rownames(res_df)
+
+# Remove NAs
+res_df <- na.omit(res_df)
+
+# Define significance
+res_df$significant <- with(res_df, padj < 0.05 &
+                             abs(log2FoldChange) > 1.5)
+
+
+# Annotate statistically and biologically DEGs
+res_df$Significant <- ifelse(res_df$padj < 0.05 &
+                               abs(res_df$log2FoldChange) > 1.5, "yes", "no")
+
+# Plot a volcano plot using the EnhancedVolcano package
+EnhancedVolcano(res_df,
+                lab = res_df$SYMBOL,
+                x = 'log2FoldChange',
+                y = 'padj',
+                pCutoff = 0.05,
+                FCcutoff = 1.5,
+                title = 'Dexamethasone Treated vs Untreated',
+                subtitle = 'DESeq2 Analysis')
+
+```
+
+
+# 7.3 MA plot
+Iteractive MAplot using plotly package.
+
+Features:
+- Hover over points to see gene names, log2FC, and padj.
+- Zoom, pan, and export as PNG.
+- Color-coded significant genes.
+
+```{r plotMA-interactive}
+
+# Build the ggplot
+ma_plot <- ggplot(res_df, 
+                  aes(x = log10(baseMean),
+                      y = log2FoldChange,
+                      text = paste("Gene:",
+                                   SYMBOL,
+                                   "<br>log2FC:", round(log2FoldChange, 2),
+                                   "<br>padj:", signif(padj, 3)))) +
+  geom_point(aes(color = significant), alpha = 0.6, size = 1.2) +
+  scale_color_manual(values = c("grey60", "red")) +
+  geom_hline(yintercept = 0,
+             color = "black",
+             linetype = "dashed") +
+  labs(title = "Interactive MA Plot",
+       x = "log10(Mean Expression)",
+       y = "log2(Fold Change)",
+       color = "Significant") +
+  theme_minimal(base_size = 14)
+
+# Generate interactive plot
+interactive_ma <- ggplotly(ma_plot,
+                           tooltip = "text")
+
+# Save plot as a HTML file
+htmlwidgets::saveWidget(interactive_ma, "RNAseq_results/MA_plot_interactive.html")
+
+# Visualize
+interactive_ma
+
+```
+
+
+# 7.4 Top 50 genes
+```{r top50-genes}
+# Number of top DEGs to include
+n_genes <- 50
+
+# Filter significant DEGs and order by adjusted p-value
+sig_res <- res_df[!is.na(res_df$padj) & res_df$padj < 0.05, ]
+top_res <- sig_res[order(sig_res$padj), ][1:n_genes, ]
+
+# Use rownames (Ensembl IDs) to match norm_counts
+top_gene_ids <- rownames(top_res)
+
+# Extract normalized expression (vst)
+norm_counts <- assay(vsd)
+
+# Subset and scale expression values across rows (genes)
+top_counts_scaled <- t(scale(t(norm_counts[top_gene_ids, ])))
+
+# Create annotation (e.g., condition only)
+annotation_col <- as.data.frame(colData(vsd)[, "condition", drop = FALSE])
+
+# Plot heatmap
+pheatmap(top_counts_scaled,
+         annotation_col = annotation_col,
+         show_rownames = TRUE,
+         fontsize_row = 4,
+         fontsize_col = 10,
+         cluster_rows = TRUE,
+         cluster_cols = TRUE,
+         main = "Top DEGs Heatmap")
+
+```
+
+
+# 7.5. Gene Set Enrichment Analysis (GSEA)
+Computational method that determines whether an a priori defined set of genes 
+shows statistically significant, concordant differences between two biological states
+(e.g. phenotypes).
+GSEA evaluates all genes, not just the differentially expressed subset.
+For the analysis of the gene set with differential expression, apply the Over-
+Representation Analysis (ORA)
+
+Use GSEA when:
+- Fold changes are subtle across many genes.
+- No clear cutoff for differential expression exists.
+- You aim to capture coordinated changes in gene sets.
+```{r gsea, warning=FALSE}
+# This block runs GSEA and applies the clusterProfiler method symplify()
+# to remove redundancy of enriched GO terms
+# It also plots dotplots before and after the use of the simplify() function, 
+# and saves all results (tables and plots) to an output directory
+
+# Create output directories for storing GSEA results and plots
+dir.create("RNAseq_results/GSEA_Results", showWarnings = F)
+dir.create("RNAseq_results/GSEA_Plots", showWarnings = F)
+
+# Prepare ranked gene list for GSEA
+# Use log2FoldChange from your DESeq2 results; ensure no NA
+res_df <- res_df[!is.na(res_df$log2FoldChange), ]
+
+# Map gene SYMBOLs to ENTREZ IDs, which are required for GSEA
+gene_map <- bitr(rownames(res_df),
+                 fromType = "SYMBOL",
+                 toType = "ENTREZID",
+                 OrgDb = org.Hs.eg.db)
+
+# # Add gene symbols as a column (for merging) and merge with ENTREZ mappings
+res_mapped <- merge(res_df, gene_map, by = "SYMBOL")
+
+# Create a ranked gene list: 
+# log2FC values named by ENTREZ IDs, sorted decreasingly
+gene_list <- res_mapped$log2FoldChange
+names(gene_list) <- res_mapped$ENTREZID
+gene_list <- sort(gene_list, decreasing = T)
+
+# # Loop through three GO ontologies: Biological Process, Cellular Component, Molecular Function
+ontologies <- c("BP", "CC", "MF")
+
+for (ont in ontologies) {
+  message("Running GSEA for GO ", ont)
+  
+  # Run GSEA using clusterProfiler's gseGO function
+  gsea_res <- gseGO(geneList = gene_list,
+                    OrgDb = org.Hs.eg.db,
+                    ont = ont,
+                    keyType = "ENTREZID",
+                    minGSSize = 10,
+                    maxGSSize = 500,
+                    pAdjustMethod = "BH",
+                    verbose = F)
+  
+  # Save raw GSEA results (before simplification) to CSV and TXT
+  write.csv(as.data.frame(gsea_res),
+            file = paste0("RNAseq_results/GSEA_Results/GO_",
+                          ont, "_gsea_raw.csv"),
+            row.names = F)
+  write.table(as.data.frame(gsea_res),
+              file = paste0("RNAseq_results/GSEA_Results/GO_",
+                            ont, "_gsea_raw.txt"),
+              row.names = F)
+  
+  # Generate dotplot of top 10 enriched terms before simplification
+  p_raw <- dotplot(gsea_res,
+                   showCategory = 10,
+                   title = paste0("GSEA GO ",
+                                  ont, " - Raw"))
+  ggsave(paste0("RNAseq_results/GSEA_Plots/GO_",
+                ont, "_gsea_dotplot_raw.png"),
+         plot = p_raw, width = 7,
+         height = 5, dpi = 300)
+  
+  # Simplify redundant GO terms using semantic similarity (GOSemSim)
+  gsea_simple <- simplify(gsea_res,
+                          cutoff = 0.7,# Similarity cutoff for merging terms
+                          by = "p.adjust", # Use padj values to retain the best
+                          select_fun = min) # Keep most significant term from a cluster
+  
+  # Save simplified GSEA results
+  write.csv(as.data.frame(gsea_simple),
+            file = paste0("RNAseq_results/GSEA_Results/GO_",
+                          ont, "_gsea_simplified.csv"),
+            row.names = F)
+  write.table(as.data.frame(gsea_simple),
+              file = paste0("RNAseq_results/GSEA_Results/GO_",
+                            ont, "_gsea_simplified.txt"),
+              row.names = F)
+  
+  # Generate simplified dotplot
+  p_simple <- dotplot(gsea_simple,
+                      showCategory = 10,
+                      title = paste0("GSEA GO ",
+                                     ont, " - Simplified"))
+  ggsave(paste0("RNAseq_results/GSEA_Plots/GO_",
+                ont, "_gsea_dotplot_simplified.png"),
+         plot = p_simple,
+         width = 7,
+         height = 5,
+         dpi = 300)
+}
+
+```
+
+
+# 7.6 Disease Ontology (DO) Analysis
+GSEA can be applied to Disease Ontology (DO) data using tools like the DOSE 
+package in Bioconductor. This allows researchers to analyze gene expression data
+and identify which disease categories (from the DO) are significantly enriched 
+with genes associated with a particular biological state or condition. 
+```{r DO-analysis, warning=F}
+
+# Create output directories for storing DO results and plots
+dir.create("RNAseq_results/GSEA_DO_Results", 
+           showWarnings = F, 
+           recursive = T)
+dir.create("RNAseq_results/GSEA_DO_Plots", 
+           showWarnings = F, 
+           recursive = T)
+
+# Run GSEA for Disease Ontology (DO) using geneList (named vector of log2FC, names=ENTREZ IDs)
+gsea_do_res <- gseDO(
+  geneList = gene_list,
+  minGSSize = 5,
+  pAdjustMethod = "BH",
+  verbose = FALSE,
+)
+
+# Convert ENTREZ IDs to gene SYMBOLS for readability in plots
+gsea_do_res <- setReadable(gsea_do_res,
+                           OrgDb = org.Hs.eg.db,
+                           keyType = "ENTREZID")
+
+# Now generate cnetplot with gene symbols
+cnet <- cnetplot(gsea_do_res,
+                 showCategory = 5,
+                 foldChange = gene_list)
+
+# Check if any significant DO terms were found
+if (is.null(gsea_do_res) || nrow(as.data.frame(gsea_do_res)) == 0) {
+  warning("No significant Disease Ontology terms found in GSEA")
+} else {
+  # Save GSEA DO results to CSV and TXT files
+  write.csv(as.data.frame(gsea_do_res),
+            file = "RNAseq_results/GSEA_DO_Results/DO_gsea_raw.csv",
+            row.names = F)
+  write.table(as.data.frame(gsea_do_res),
+              file = "RNAseq_results/GSEA_DO_Results/DO_gsea_raw.txt",
+              row.names = F)
+
+  # Generate and save cnetplot visualization of top 5 enriched DO terms
+  cnet <- cnetplot(gsea_do_res, showCategory = 5, foldChange = gene_list)
+  ggsave("RNAseq_results/GSEA_DO_Plots/DO_gsea_cnetplot.png",
+       plot = cnet, width = 8, height = 6, dpi = 300)
+}
+
+# Print it 
+print(cnet)
+
+```
+
+
+# 7.7. Over-representation Analysis (ORA)
+Statistical method used to determine if a specific set of genes or proteins, 
+often those involved in a particular biological process or pathway, are present
+more frequently than expected by chance in a larger list of genes or proteins of interest (e.g., differentially expressed genes). 
+It essentially tests for enrichment of predefined gene sets within a larger 
+gene list. 
+This analysis helps researchers identify biological pathways or functional 
+categories that are significantly enriched in a list of genes or proteins,
+suggesting that these pathways are more likely to be involved in the biological process being studied. 
+```{r ora}
+
+# This block runs GO ORA and applies the clusterProfiler method `simplify()` 
+# to remove redundancy of enriched GO terms.
+# It also generates dotplots before and after simplification and saves 
+# all results (CSV, TXT, PNG) to an output directory.
+
+# Create output directories for ORA results and plots
+dir.create("RNAseq_results/GO_ORA_Results", showWarnings = F)
+dir.create("RNAseq_results/GO_ORA_Plots", showWarnings = F)
+
+# Identify significantly differentially expressed genes
+# Criteria: padj < 0.05 and |log2FoldChange| > 1.5
+sig_genes_FC <- rownames(res_df[
+  !is.na(res_df$padj) & 
+    res_df$padj < 0.05 & 
+    abs(res_df$log2FoldChange) > 1.5,])
+
+# Define the universe/background gene list as all genes tested
+universe_genes <- rownames(res_df)
+
+# Convert significant gene symbols to ENTREZ IDs
+gene_df <- bitr(sig_genes_FC,
+                fromType = "SYMBOL",
+                toType = "ENTREZID",
+                OrgDb = org.Hs.eg.db)
+
+# Convert background gene symbols to ENTREZ IDs
+bg_df <- bitr(universe_genes,
+              fromType = "SYMBOL",
+              toType = "ENTREZID",
+              OrgDb = org.Hs.eg.db)
+
+# Extract ENTREZ IDs
+sig_entrez <- gene_df$ENTREZID
+bg_entrez <- bg_df$ENTREZID
+
+# Loop over GO ontologies: BP, CC, MF
+ontologies <- c("BP", "CC", "MF")
+
+# Run GO enrichment analysis
+for (ont in ontologies) {
+  message("Running GO ORA for ", ont)
+  
+  # Perform enrichment
+  ego <- enrichGO(gene = sig_entrez,
+                  universe = bg_entrez,
+                  keyType = "ENTREZID",
+                  OrgDb = org.Hs.eg.db,
+                  ont = ont,
+                  pAdjustMethod = "BH",
+                  readable = T)
+  
+  # Save raw results (before simplify)
+  write.csv(as.data.frame(ego),
+            file = paste0("RNAseq_results/GO_ORA_Results/GO_",
+                          ont, "_raw.csv"), 
+            row.names = F)
+  write.table(as.data.frame(ego),
+            file = paste0("RNAseq_results/GO_ORA_Results/GO_",
+                          ont, "_raw.txt"),
+            row.names = F)
+  
+  # Dotplot (before simplify)
+  p_raw <- dotplot(ego,
+                   showCategory = 10,
+                   title = paste0("GO ", ont, " - Raw"))
+  ggsave(paste0("RNAseq_results/GO_ORA_Plots/GO_",
+                ont, "_dotplot_raw.png"),
+         plot = p_raw, width = 7,
+         height = 5,
+         dpi = 300)
+ 
+  
+  # Simplify enriched terms using semantic similarity
+  ego_simple <- simplify(ego,
+                         cutoff = 0.7,# Similarity cutoff
+                         by = "p.adjust",
+                         select_fun = min) # Choose the most significant term per group
+  
+  # Save simplified results
+  write.csv(as.data.frame(ego_simple),
+            file = paste0("RNAseq_results/GO_ORA_Results/GO_", 
+                          ont, "_simplified.csv"),
+            row.names = F)
+  write.table(as.data.frame(ego_simple),
+            file = paste0("RNAseq_results/GO_ORA_Results/GO_",
+                          ont, "_simplified.txt"),
+            row.names = F)
+  
+  # Dotplot (after simplify)
+  p_simple <- dotplot(ego_simple,
+                      showCategory = 10,
+                      title = paste0("GO ",
+                                     ont, " - Simplified"))
+  ggsave(paste0("RNAseq_results/GO_ORA_Plots/GO_",
+                ont, "_dotplot_simplified.png"),
+         plot = p_simple,
+         width = 7,
+         height = 5,
+         dpi = 300)
+}
+
+```
+
+This is a wrapped and automated version of the ORA script for All significant 
+genes and also with significant upregulated, and downregulated genes with 
+built-in checks, error handling. 
+
+```{r ORA-All-UP-Down}
+
+# Base output path
+base_dir <- "RNAseq_results"
+
+# Create output directories for ORA results and plots
+dir.create(file.path(base_dir, "GO_ORA_Results"),
+           showWarnings = F,
+           recursive = T)
+dir.create(file.path(base_dir, "GO_ORA_Plots"),
+           showWarnings = F,
+           recursive = T)
+
+# Define DEG sets: all significant, upregulated, and downregulated
+gene_sets <- list(
+  All  = res_df[!is.na(res_df$padj) &
+                  res_df$padj < 0.05 &
+                  abs(res_df$log2FoldChange) > 1.5, ],
+  Up   = res_df[!is.na(res_df$padj) &
+                  res_df$padj < 0.05 &
+                  res_df$log2FoldChange > 1.5, ],
+  Down = res_df[!is.na(res_df$padj) &
+                  res_df$padj < 0.05 &
+                  res_df$log2FoldChange < -1.5, ]
+)
+
+# Define background gene universe
+universe_genes <- rownames(res_df)
+bg_df <- bitr(universe_genes,
+              fromType = "SYMBOL",
+              toType = "ENTREZID",
+              OrgDb = org.Hs.eg.db)
+bg_entrez <- unique(bg_df$ENTREZID)
+
+# ORA function with dotplot + simplify + save
+run_ora <- function(gene_df, bg_entrez, tag) {
+  message("Running ORA for set: ", tag)
+  
+  # Convert SYMBOLs to ENTREZ IDs
+  gene_symbols <- rownames(gene_df)
+  gene_df_mapped <- bitr(gene_symbols,
+                         fromType = "SYMBOL",
+                         toType = "ENTREZID",
+                         OrgDb = org.Hs.eg.db)
+
+  # Skip sets with too few genes mapped
+  if (is.null(gene_df_mapped) || nrow(gene_df_mapped) < 10) {
+    warning("Skipping ORA for ", tag, " — Not enough mapped genes.")
+    return(NULL)
+  }
+
+  sig_entrez <- unique(gene_df_mapped$ENTREZID)
+
+  # Loop over GO ontologies: BP, CC, MF
+  for (ont in c("BP", "CC", "MF")) {
+    message("GO Ontology: ", ont)
+
+    # Run GO over-representation analysis
+    ego <- enrichGO(
+      gene = sig_entrez,
+      universe = bg_entrez,
+      keyType = "ENTREZID",
+      OrgDb = org.Hs.eg.db,
+      ont = ont,
+      pAdjustMethod = "BH",
+      readable = T
+    )
+
+    # Check for results
+    if (is.null(ego) || nrow(as.data.frame(ego)) == 0) {
+      warning("No enrichment found for ", tag, " - GO ", ont)
+      next
+    }
+
+    # Define output filename prefix
+    out_prefix <- paste0(base_dir, "/GO_ORA_Results/", tag, "_GO_", ont)
+
+    # Save raw ORA results
+    write.csv(as.data.frame(ego),
+              paste0(out_prefix, "_raw.csv"),
+              row.names = F)
+    write.table(as.data.frame(ego),
+                paste0(out_prefix, "_raw.txt"),
+                row.names = F)
+
+    # Plot and save raw dotplot
+    p_raw <- dotplot(ego, 
+                     showCategory = 10,
+                     title = paste0(tag, " GO ", ont, " - Raw"))
+    ggsave(filename = paste0(base_dir, "/GO_ORA_Plots/",
+                             tag, "_GO_",
+                             ont, "_dotplot_raw.png"),
+           plot = p_raw, width = 7,
+           height = 5,
+           dpi = 300
+    )
+
+    # Simplify redundant terms
+    ego_simple <- simplify(ego, cutoff = 0.7, by = "p.adjust", select_fun = min)
+
+    # Check if simplify produced output
+    if (!is.null(ego_simple) && nrow(as.data.frame(ego_simple)) > 0) {
+      # Save simplified results
+      write.csv(as.data.frame(ego_simple),
+                paste0(out_prefix, "_simplified.csv"),
+                row.names = FALSE)
+      write.table(as.data.frame(ego_simple),
+                  paste0(out_prefix, "_simplified.txt"),
+                  row.names = FALSE)
+
+      # Simplified dotplot
+      p_simple <- dotplot(ego_simple,
+                          showCategory = 10,
+                          title = paste0(tag, " GO ", ont, " - Simplified"))
+      ggsave(filename = paste0(base_dir, "/GO_ORA_Plots/",
+                               tag, "_GO_",
+                               ont, "_dotplot_simplified.png"),
+             plot = p_simple,
+             width = 7,
+             height = 5,
+             dpi = 300
+      )
+    } else {
+      warning("No terms retained after simplify() for ", tag, " - GO ", ont)
+    }
+  }
+}
+
+# Run ORA pipeline for each gene set
+for (set_name in names(gene_sets)) {
+  run_ora(gene_sets[[set_name]], bg_entrez, tag = set_name)
+}
+
+```
+
+
+# 7.8 Pathway Analysis using the Kioto Encyclopedia Of Genes and Genomes (KEGG)
+KEGG PATHWAY is a collection of manually drawn pathway maps representing our 
+knowledge of the molecular interaction, reaction and relation networks.
+Note that we wil not be using the simpify() function to simplify KEGG results
+as this function is designed for GO terms, not KEGG pathways.
+KEGG pathways do not have this hierarchical structure. 
+Running simplify() will throw an error.
+```{r KEGG-ALL-Up-Down}
+
+# Define output directories
+base_dir <- "RNAseq_results"
+dir.create(file.path(base_dir, "KEGG_Results"),
+           showWarnings = F,
+           recursive = T)
+dir.create(file.path(base_dir, "KEGG_Plots"), 
+           showWarnings = F, 
+           recursive = T)
+
+# KEGG analysis function
+run_kegg <- function(gene_df, bg_entrez, tag) {
+  message("Running KEGG for set: ", tag)
+
+  # Map SYMBOLs to ENTREZ IDs
+  gene_symbols <- rownames(gene_df)
+  gene_df_mapped <- bitr(gene_symbols,
+                         fromType = "SYMBOL",
+                         toType = "ENTREZID",
+                         OrgDb = org.Hs.eg.db)
+
+  if (is.null(gene_df_mapped) || nrow(gene_df_mapped) < 10) {
+    warning("Skipping KEGG for ", tag, " — Not enough mapped genes.")
+    return(NULL)
+  }
+
+  sig_entrez <- unique(gene_df_mapped$ENTREZID)
+
+  # Run KEGG enrichment
+  kegg <- enrichKEGG(
+    gene = sig_entrez,
+    universe = bg_entrez,
+    organism = 'hsa',
+    keyType = "kegg",  # required by enrichKEGG
+    pAdjustMethod = "BH"
+  )
+
+  # Check for results
+  if (is.null(kegg) || nrow(as.data.frame(kegg)) == 0) {
+    warning("No KEGG pathways enriched for ", tag)
+    return(NULL)
+  }
+
+  # Convert ENTREZ IDs to readable gene SYMBOLs
+  kegg <- setReadable(kegg,
+                      OrgDb = org.Hs.eg.db,
+                      keyType = "ENTREZID")
+
+  # Define output prefix
+  out_prefix <- file.path(base_dir, "KEGG_Results", paste0("KEGG_", tag))
+
+  # Save results
+  write.csv(as.data.frame(kegg), 
+            paste0(out_prefix, "_raw.csv"), 
+            row.names = F)
+  write.table(as.data.frame(kegg), 
+              paste0(out_prefix, "_raw.txt"), 
+              row.names = F)
+
+  # Plot and save dotplot
+  p_kegg <- dotplot(kegg, showCategory = 10, 
+                    title = paste0("KEGG Enrichment - ", tag))
+  ggsave(filename = file.path(base_dir, "KEGG_Plots",
+                              paste0("KEGG_dotplot_",
+                                     tag, ".png")),
+         plot = p_kegg, 
+         width = 7, 
+         height = 5, 
+         dpi = 300
+  )
+}
+
+# Run for each gene set
+for (set_name in names(gene_sets)) {
+  run_kegg(gene_sets[[set_name]], bg_entrez, tag = set_name)
+}
+```
+
+
+
+```{r display-session-info}
+
+sessionInfo()
+
+```
+
